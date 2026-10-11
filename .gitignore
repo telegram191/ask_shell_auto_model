@@ -1,0 +1,12 @@
+node_modules/
+dist/
+schema.json
+.DS_Store
+*.log
+
+# Local credentials and configuration
+.env
+.env.*
+!.env.example
+shell-ask.json
+data.txt

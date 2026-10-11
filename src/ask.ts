@@ -1,0 +1,298 @@
+import process from "node:process"
+import { CoreMessage, generateText, streamText } from "ai"
+import { loadFiles, notEmpty } from "./utils"
+import { loadConfig } from "./config"
+import {
+  MODEL_PREFIXES,
+  getAllModels,
+  getCheapModelId,
+  toProviderModelId,
+} from "./models"
+import cliPrompts from "prompts"
+import { isOutputTTY, stdin } from "./tty"
+import { CliError } from "./error"
+import { getSDKModel } from "./ai-sdk"
+import { debug } from "./debug"
+import { fetchUrl } from "./fetch-url"
+import { getSearchResult } from "./search"
+import logUpdate from "log-update"
+import { renderMarkdown } from "./markdown"
+import { loadChat, saveChat } from "./chat"
+
+export async function ask(
+  prompt: string | undefined,
+  options: {
+    model?: string | boolean
+    autoModel?: boolean
+    command?: boolean
+    pipeInput?: string
+    files?: string | string[]
+    type?: string
+    url?: string | string[]
+    search?: boolean
+    stream?: boolean
+    reply?: boolean
+    breakdown?: boolean
+  }
+) {
+  if (!prompt) {
+    throw new CliError("please provide a prompt")
+  }
+
+  const chat = options.reply ? loadChat() : null
+  const config = loadConfig()
+  let modelId = options.autoModel
+    ? "auto"
+    : options.model === true
+      ? "select"
+      : options.model ||
+        chat?.options.realModelId ||
+        config.default_model ||
+        "gpt-4o-mini"
+
+  const models = await getAllModels(
+    !options.autoModel && modelId === "select"
+      ? true
+      : !options.autoModel &&
+          (modelId === "ollama" || modelId.startsWith("ollama-"))
+        ? "required"
+        : false,
+    config
+  )
+
+  if (
+    !options.autoModel &&
+    (modelId === "select" ||
+      modelId === "ollama" ||
+      (typeof modelId === "string" && MODEL_PREFIXES.includes(modelId)))
+  ) {
+    if (process.platform === "win32" && !process.stdin.isTTY) {
+      throw new CliError(
+        "Interactively selecting a model is not supported on Windows when using piped input. Consider directly specifying the model id instead, for example: `-m gpt-4o`"
+      )
+    }
+
+    const result = await cliPrompts([
+      {
+        stdin,
+
+        type: "autocomplete",
+
+        message: "Select a model",
+
+        name: "modelId",
+
+        async suggest(input, choices) {
+          return choices.filter((choice) => {
+            return choice.title.toLowerCase().includes(input)
+          })
+        },
+
+        choices: models
+          .filter(
+            (item) => modelId === "select" || item.id.startsWith(`${modelId}-`)
+          )
+          .map((item) => {
+            return {
+              value: item.id,
+              title: item.id,
+            }
+          }),
+      },
+    ])
+
+    if (typeof result.modelId !== "string" || !result.modelId) {
+      throw new CliError("no model selected")
+    }
+
+    modelId = result.modelId
+  }
+
+  const matchedModel = options.autoModel
+    ? undefined
+    : models.find((m) => m.id === modelId || m.realId === modelId)
+  if (!options.autoModel && !matchedModel) {
+    throw new CliError(
+      `model not found: ${modelId}\n\navailable models: ${models
+        .map((m) => m.id)
+        .join(", ")}`
+    )
+  }
+
+  const candidateModels = options.autoModel
+    ? models.filter((model) => model.openaiCompatible)
+    : [matchedModel!]
+
+  if (options.autoModel && candidateModels.length === 0) {
+    throw new CliError(
+      "no models found from the configured OpenAI-compatible API; set openai_api_url and check the /models endpoint"
+    )
+  }
+
+  // Shuffle candidates so each automatic run starts with a random model.
+  for (let i = candidateModels.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[candidateModels[i], candidateModels[j]] = [
+      candidateModels[j],
+      candidateModels[i],
+    ]
+  }
+  const modelsToTry = options.autoModel
+    ? candidateModels.slice(0, 10)
+    : candidateModels
+
+  if (!options.autoModel) {
+    debug(`Selected modelID: ${modelId}`)
+  }
+
+  const files = await loadFiles(options.files || [])
+  const remoteContents = await fetchUrl(options.url || [])
+  const temperature = 0
+
+  let lastError: unknown
+  for (const [index, candidateModel] of modelsToTry.entries()) {
+    const candidateId = candidateModel.realId || candidateModel.id
+
+    try {
+      const model = await getSDKModel(
+        candidateModel.id,
+        config,
+        candidateModel.openaiCompatible
+      )
+      const isOpenAIReasoning = /-o\d+/.test(candidateModel.id)
+      const isCopilotOpenAIReasoning = /copilot-o\d+/.test(candidateModel.id)
+      const isCopilotOpenAIO1 = /copilot-o1/.test(candidateModel.id)
+      const context = [
+        // inherit previous chat
+        !chat &&
+          isOpenAIReasoning &&
+          (isCopilotOpenAIReasoning
+            ? `Using markdown formatting if necessary`
+            : `Formatting re-enabled`),
+        !chat && `Context:`,
+        !chat &&
+          `platform: ${process.platform}\nshell: ${process.env.SHELL || "unknown"}`,
+        options.pipeInput &&
+          [`stdin:`, "```", options.pipeInput, "```"].join("\n"),
+        files.length > 0 && "files:",
+        ...files.map((file) => `${file.name}:\n"""\n${file.content}\n"""`),
+        remoteContents.length > 0 && "remote contents:",
+        ...remoteContents.map(
+          (content) => `${content.url}:\n"""\n${content.content}\n"""`
+        ),
+      ]
+        .filter(notEmpty)
+        .join("\n")
+
+      let searchResult: string | undefined
+      if (options.search) {
+        const searchModel = model(
+          candidateModel.openaiCompatible
+            ? candidateId
+            : getCheapModelId(candidateId)
+        )
+        searchResult = await getSearchResult(searchModel, { context, prompt })
+      }
+
+      const messages: CoreMessage[] = []
+      const prevSystemMessage = chat?.messages[0]
+      messages.push({
+        // Copilot OpenAI reasoning models reject system messages.
+        role: isCopilotOpenAIReasoning ? "user" : "system",
+        content:
+          (prevSystemMessage?.content ? `${prevSystemMessage.content}\n` : "") +
+          [context, searchResult && "search result:", searchResult]
+            .filter(notEmpty)
+            .join("\n"),
+      })
+      if (chat) messages.push(...chat.messages.slice(1))
+      messages.push({
+        role: "user",
+        content: [
+          prompt,
+          options.command
+            ? `Return the command only without any other text or markdown code fences.`
+            : ``,
+          options.breakdown
+            ? `You must return in the following format:\n...command\n\n...command breakdown`
+            : ``,
+          options.type
+            ? [
+                `The result must match the following type definition:`,
+                "```typescript",
+                options.type,
+                "```",
+                "Return the result only without any other text or markdown code fences.",
+              ].join("\n")
+            : ``,
+        ]
+          .filter(notEmpty)
+          .join("\n"),
+      })
+      debug("model", candidateId)
+      debug("messages", messages)
+
+      if (isOutputTTY) {
+        logUpdate(`Waiting for ${candidateId} to respond...`)
+      }
+
+      const providerModelId = candidateModel.openaiCompatible
+        ? candidateId
+        : toProviderModelId(candidateId)
+      let output = ""
+
+      // Copilot O1 doesn't support streaming yet.
+      if (options.stream === false || isCopilotOpenAIO1) {
+        const result = await generateText({
+          model: model(providerModelId),
+          messages,
+          temperature,
+        })
+        output = result.text
+        logUpdate.clear()
+        logUpdate(renderMarkdown(output).trim())
+        logUpdate.done()
+      } else {
+        const { textStream } = streamText({
+          model: model(providerModelId),
+          messages,
+          temperature,
+        })
+        logUpdate.clear()
+        for await (const textPart of textStream) {
+          output += textPart
+          if (!options.autoModel) process.stdout.write(textPart)
+        }
+
+        if (options.autoModel) {
+          process.stdout.write(`${output}\n`)
+        } else {
+          process.stdout.write("\n")
+        }
+
+        saveChat({
+          messages: [...messages, { role: "assistant", content: output }],
+          options: { realModelId: candidateId, temperature },
+        })
+        logUpdate.done()
+      }
+
+      process.exit()
+    } catch (error) {
+      if (!options.autoModel || error instanceof CliError) throw error
+
+      lastError = error
+      logUpdate.clear()
+      const message = error instanceof Error ? error.message : String(error)
+      debug(`Model ${candidateId} failed: ${message}`)
+
+      if (index + 1 < modelsToTry.length) {
+        logUpdate(
+          `${candidateId} failed; trying another model (${index + 2}/${modelsToTry.length})...`
+        )
+      }
+    }
+  }
+
+  if (lastError !== undefined) throw lastError
+}
