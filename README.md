@@ -75,16 +75,24 @@ ask "question" -m gpt-4o
 ask "question" -m claude-3-opus
 ```
 
-Automatically try up to 10 randomly ordered models discovered from your
-configured OpenAI-compatible API. If one model request fails, `ask` tries the
-next model and stops after the first successful response:
+By default, `ask` tries up to 10 randomly ordered models discovered from your
+configured OpenAI-compatible API. If one model request fails, it is added to a
+persistent blacklist, then `ask` tries the next model and stops after the first
+successful response. You no longer need `--auto-model`:
 
 ```bash
-ask "question" --auto-model
+ask "question"
 ```
 
 This requires `openai_api_url` and `openai_api_key` in your config. Run
-`ask list` to verify the endpoint's `/models` response is available.
+`ask list` to verify the endpoint's `/models` response is available. Manage the
+blacklist with:
+
+```bash
+ask blacklist                         # list blacklisted models
+ask blacklist-add <model-id>          # blacklist a model manually
+ask blacklist-reset                   # clear the blacklist
+```
 
 Prompt without quotes:
 

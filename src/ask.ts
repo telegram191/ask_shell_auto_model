@@ -18,6 +18,10 @@ import { getSearchResult } from "./search"
 import logUpdate from "log-update"
 import { renderMarkdown } from "./markdown"
 import { loadChat, saveChat } from "./chat"
+import {
+  addModelToBlacklist,
+  getBlacklistedModelIds,
+} from "./model-blacklist"
 
 export async function ask(
   prompt: string | undefined,
@@ -41,19 +45,17 @@ export async function ask(
 
   const chat = options.reply ? loadChat() : null
   const config = loadConfig()
-  let modelId = options.autoModel
-    ? "auto"
-    : options.model === true
+  let modelId = options.model === true
       ? "select"
       : options.model ||
-        chat?.options.realModelId ||
         config.default_model ||
-        "gpt-4o-mini"
+        "auto"
+  const autoModel = options.autoModel === true || modelId === "auto"
 
   const models = await getAllModels(
-    !options.autoModel && modelId === "select"
+    !autoModel && modelId === "select"
       ? true
-      : !options.autoModel &&
+      : !autoModel &&
           (modelId === "ollama" || modelId.startsWith("ollama-"))
         ? "required"
         : false,
@@ -61,7 +63,7 @@ export async function ask(
   )
 
   if (
-    !options.autoModel &&
+    !autoModel &&
     (modelId === "select" ||
       modelId === "ollama" ||
       (typeof modelId === "string" && MODEL_PREFIXES.includes(modelId)))
@@ -108,10 +110,10 @@ export async function ask(
     modelId = result.modelId
   }
 
-  const matchedModel = options.autoModel
+  const matchedModel = autoModel
     ? undefined
     : models.find((m) => m.id === modelId || m.realId === modelId)
-  if (!options.autoModel && !matchedModel) {
+  if (!autoModel && !matchedModel) {
     throw new CliError(
       `model not found: ${modelId}\n\navailable models: ${models
         .map((m) => m.id)
@@ -119,13 +121,21 @@ export async function ask(
     )
   }
 
-  const candidateModels = options.autoModel
-    ? models.filter((model) => model.openaiCompatible)
+  const blacklistedModelIds = new Set(getBlacklistedModelIds())
+  const candidateModels = autoModel
+    ? models.filter(
+        (model) =>
+          model.openaiCompatible &&
+          !blacklistedModelIds.has(model.id) &&
+          !blacklistedModelIds.has(model.realId || model.id)
+      )
     : [matchedModel!]
 
-  if (options.autoModel && candidateModels.length === 0) {
+  if (autoModel && candidateModels.length === 0) {
     throw new CliError(
-      "no models found from the configured OpenAI-compatible API; set openai_api_url and check the /models endpoint"
+      blacklistedModelIds.size > 0
+        ? "no usable models found; check the OpenAI-compatible /models endpoint or run `ask blacklist-reset` to clear the model blacklist"
+        : "no models found from the configured OpenAI-compatible API; set openai_api_url and check the /models endpoint"
     )
   }
 
@@ -137,11 +147,11 @@ export async function ask(
       candidateModels[i],
     ]
   }
-  const modelsToTry = options.autoModel
+  const modelsToTry = autoModel
     ? candidateModels.slice(0, 10)
     : candidateModels
 
-  if (!options.autoModel) {
+  if (!autoModel) {
     debug(`Selected modelID: ${modelId}`)
   }
 
@@ -261,10 +271,10 @@ export async function ask(
         logUpdate.clear()
         for await (const textPart of textStream) {
           output += textPart
-          if (!options.autoModel) process.stdout.write(textPart)
+          if (!autoModel) process.stdout.write(textPart)
         }
 
-        if (options.autoModel) {
+        if (autoModel) {
           process.stdout.write(`${output}\n`)
         } else {
           process.stdout.write("\n")
@@ -279,9 +289,10 @@ export async function ask(
 
       process.exit()
     } catch (error) {
-      if (!options.autoModel || error instanceof CliError) throw error
+      if (!autoModel || error instanceof CliError) throw error
 
       lastError = error
+      addModelToBlacklist(candidateModel.id)
       logUpdate.clear()
       const message = error instanceof Error ? error.message : String(error)
       debug(`Model ${candidateId} failed: ${message}`)

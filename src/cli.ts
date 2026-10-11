@@ -11,6 +11,11 @@ import { CliError } from "./error"
 import { loadConfig } from "./config"
 import { copilot } from "./copilot"
 import { APICallError } from "ai"
+import {
+  addModelToBlacklist,
+  getBlacklistedModelIds,
+  resetModelBlacklist,
+} from "./model-blacklist"
 
 if (typeof PKG_NAME === "string" && typeof PKG_VERSION === "string") {
   updateNotifier({
@@ -71,6 +76,27 @@ async function main() {
         console.log(model.id)
       }
     })
+
+  cli.command("blacklist", "List blacklisted models").action(() => {
+    const modelIds = getBlacklistedModelIds()
+    if (modelIds.length === 0) {
+      console.log("Model blacklist is empty")
+      return
+    }
+    for (const modelId of modelIds) console.log(modelId)
+  })
+
+  cli
+    .command("blacklist-add <model-id>", "Add a model to the blacklist")
+    .action((modelId) => {
+      addModelToBlacklist(modelId)
+      console.log(`Blacklisted model: ${modelId}`)
+    })
+
+  cli.command("blacklist-reset", "Clear the model blacklist").action(() => {
+    const count = resetModelBlacklist()
+    console.log(`Cleared ${count} blacklisted model${count === 1 ? "" : "s"}`)
+  })
 
   cli.command("copilot-login").action(async () => {
     const deviceCodeResult = await copilot.requestDeviceCode()
